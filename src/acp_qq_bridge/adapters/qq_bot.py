@@ -141,6 +141,7 @@ _status_matcher = on_command("status", aliases={"状态"}, priority=5, block=Tru
 _persona_matcher = on_command("persona", aliases={"人设"}, priority=5, block=True)
 _cd_matcher = on_command("cd", priority=5, block=True)
 _session_matcher = on_command("session", priority=5, block=True)
+_help_matcher = on_command("help", aliases={"帮助", "命令"}, priority=5, block=True)
 
 
 @_message_matcher.handle()
@@ -374,6 +375,9 @@ async def _handle_session(
     assert _agent_ws is not None
 
     qq_id, qq_type = _get_qq_id_and_type(event)
+    # Auto-create session if none exists — session management commands
+    # should work even before the first regular chat.
+    session_id = await _ensure_session(qq_id, qq_type)
     meta = await _session_manager.get_by_qq(qq_id)
     if meta is None:
         await _send_qq_message(bot, qq_id, qq_type, "❌ 当前没有活跃会话。")
@@ -422,6 +426,31 @@ async def _handle_session(
         bot, qq_id, qq_type,
         f"❌ 未知子命令: `{subcmd}`。可用: `list`, `use`"
     )
+
+
+@_help_matcher.handle()
+async def _handle_help(bot: Bot, event: MessageEvent) -> None:
+    """Handle the /help command — list all available commands."""
+    qq_id, qq_type = _get_qq_id_and_type(event)
+
+    reply = (
+        "📖 可用命令列表\n"
+        "━━━━━━━━━━━━━━\n"
+        "`/stop` / `打断` — 打断当前任务\n"
+        "`/status` / `状态` — 查询会话状态\n"
+        "`/persona` / `人设` — 切换角色人设\n"
+        "`/cd <路径>` — 切换工作目录\n"
+        "`/session list` — 列出 Kimi 历史会话\n"
+        "`/session use <id>` — 切换到指定会话\n"
+        "`/help` — 显示此帮助\n"
+        "━━━━━━━━━━━━━━\n"
+    )
+    if _is_superuser(event):
+        reply += "🔑 你是主人，拥有全部权限~"
+    else:
+        reply += "🔒 部分命令仅限主人使用"
+
+    await _send_qq_message(bot, qq_id, qq_type, reply)
 
 
 # ------------------------------------------------------------------ #
