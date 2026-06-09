@@ -1,0 +1,28 @@
+# ACP-QQ Bridge 运行时配置模板
+
+# Agent WebSocket 连接配置
+agent:
+  ws_url: "ws://localhost:8765"
+  token: "your-secure-token-here"
+  heartbeat_interval: 30
+  reconnect_max_interval: 30
+  response_timeout: 60
+
+# QQ 机器人配置
+qq:
+  command_prefixes: ["/", "!"]
+  superusers: []
+  session_ttl: 3600
+
+# 安全配置
+security:
+  enable_ast_audit: true
+  enable_sensitive_filter: true
+  allowed_commands: ["ls", "cat", "grep", "find", "pwd", "echo", "python", "pytest"]
+  sensitive_patterns: ["rm -rf", "mkfs", "dd if=/dev/zero", ">/dev/sda", "format", "del /f /s /q"]
+  max_message_length: 4096
+
+# 人设配置
+persona:
+  default_persona: "assistant"
+  personas_dir: "./personas"
