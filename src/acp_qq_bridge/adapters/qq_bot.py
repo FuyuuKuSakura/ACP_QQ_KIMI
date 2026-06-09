@@ -128,6 +128,8 @@ _message_matcher = on_message(rule=to_me(), priority=10, block=False)
 _stop_matcher = on_command("stop", aliases={"打断", "停止"}, priority=5, block=True)
 _status_matcher = on_command("status", aliases={"状态"}, priority=5, block=True)
 _persona_matcher = on_command("persona", aliases={"人设"}, priority=5, block=True)
+_cd_matcher = on_command("cd", priority=5, block=True)
+_session_matcher = on_command("session", priority=5, block=True)
 
 
 @_message_matcher.handle()
@@ -151,8 +153,11 @@ async def _handle_message(bot: Bot, event: MessageEvent) -> None:
 
     session_id = await _ensure_session(qq_id, qq_type)
 
-    # Security check
-    sec_result = _security_engine.validate_command(raw_text)
+    # Security check - only validate whitelist for command-like messages
+    # (messages starting with / or !).  Regular chat only goes through
+    # sensitive-word filtering.
+    is_command = raw_text.strip().startswith(("/", "!"))
+    sec_result = _security_engine.validate_command(raw_text, strict=is_command)
     if not sec_result.passed:
         reply = f"⚠️ 安全警告: {sec_result.reason}"
         await _send_qq_message(bot, qq_id, qq_type, reply)
@@ -258,6 +263,118 @@ async def _handle_persona(
 
     _session_personas[meta.session_id] = persona_arg
     await _send_qq_message(bot, qq_id, qq_type, f"✅ 人设已切换为: {persona_arg}")
+
+
+@_cd_matcher.handle()
+async def _handle_cd(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    """Handle the /cd command to switch working directory."""
+    assert _session_manager is not None
+    assert _agent_ws is not None
+
+    qq_id, qq_type = _get_qq_id_and_type(event)
+    meta = await _session_manager.get_by_qq(qq_id)
+    if meta is None:
+        await _send_qq_message(bot, qq_id, qq_type, "❌ 当前没有活跃会话。")
+        return
+
+    path_str = args.extract_plain_text().strip()
+    if not path_str:
+        await _send_qq_message(bot, qq_id, qq_type, "用法: `/cd <目录路径>`")
+        return
+
+    # Expand ~ and resolve absolute path
+    import os
+    resolved = os.path.expanduser(path_str)
+    if not os.path.isabs(resolved):
+        resolved = os.path.abspath(resolved)
+
+    # Security: must be within home directory
+    home = os.path.expanduser("~")
+    if not resolved.startswith(home):
+        await _send_qq_message(
+            bot, qq_id, qq_type,
+            f"⚠️ 安全限制: 只能切换到 home 目录下的路径。\n目标: `{resolved}`"
+        )
+        return
+
+    if not os.path.isdir(resolved):
+        await _send_qq_message(
+            bot, qq_id, qq_type,
+            f"⚠️ 目录不存在: `{resolved}`"
+        )
+        return
+
+    upstream = UpstreamMessage(
+        session_id=meta.session_id,
+        action="inject",
+        payload=UpstreamPayload(text="__CD__", work_dir=resolved),
+    )
+    await _agent_ws.send_message(upstream)
+
+
+@_session_matcher.handle()
+async def _handle_session(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    """Handle the /session command (list / use)."""
+    assert _session_manager is not None
+    assert _agent_ws is not None
+
+    qq_id, qq_type = _get_qq_id_and_type(event)
+    meta = await _session_manager.get_by_qq(qq_id)
+    if meta is None:
+        await _send_qq_message(bot, qq_id, qq_type, "❌ 当前没有活跃会话。")
+        return
+
+    arg_text = args.extract_plain_text().strip()
+    if not arg_text:
+        await _send_qq_message(
+            bot, qq_id, qq_type,
+            "用法:\n`/session list` — 列出历史会话\n`/session use <session_id>` — 切换到指定会话"
+        )
+        return
+
+    parts = arg_text.split(None, 1)
+    subcmd = parts[0].lower()
+
+    if subcmd == "list":
+        upstream = UpstreamMessage(
+            session_id=meta.session_id,
+            action="inject",
+            payload=UpstreamPayload(text="__LIST_SESSIONS__"),
+        )
+        await _agent_ws.send_message(upstream)
+        return
+
+    if subcmd == "use":
+        if len(parts) < 2:
+            await _send_qq_message(
+                bot, qq_id, qq_type,
+                "用法: `/session use <session_id>`"
+            )
+            return
+        target_sid = parts[1].strip()
+        upstream = UpstreamMessage(
+            session_id=meta.session_id,
+            action="inject",
+            payload=UpstreamPayload(
+                text="__USE_SESSION__",
+                kimi_session_id=target_sid,
+            ),
+        )
+        await _agent_ws.send_message(upstream)
+        return
+
+    await _send_qq_message(
+        bot, qq_id, qq_type,
+        f"❌ 未知子命令: `{subcmd}`。可用: `list`, `use`"
+    )
 
 
 # ------------------------------------------------------------------ #

@@ -58,6 +58,22 @@ class KimiSession:
         self.kimi_session_id: str | None = None
         self._lock = asyncio.Lock()
 
+    def set_work_dir(self, path: Path) -> None:
+        """Switch the working directory for subsequent kimi CLI calls."""
+        self.work_dir = path
+        logger.info("[%s] Work dir switched to %s", self.qq_session_id, path)
+
+    def set_kimi_session_id(self, sid: str) -> None:
+        """Bind to an existing Kimi session ID."""
+        self.kimi_session_id = sid
+        logger.info("[%s] Kimi session ID set to %s", self.qq_session_id, sid)
+
+    async def summarize(self) -> str:
+        """Ask kimi to summarize the current session progress."""
+        return await self.ask(
+            "请总结一下当前会话到目前为止的进度，包括已经做了什么、当前的计划和下一步行动。"
+        )
+
     async def ask(self, text: str) -> str:
         """Send a message to kimi CLI and return the assistant reply."""
         async with self._lock:
@@ -167,6 +183,71 @@ class KimiCodeBridgeServer:
         except Exception:
             logger.exception("Handler error")
 
+    def _list_kimi_sessions(self) -> str:
+        """Read ~/.kimi-code/session_index.jsonl and format session list."""
+        index_path = Path.home() / ".kimi-code" / "session_index.jsonl"
+        if not index_path.exists():
+            return "暂无 Kimi 历史会话记录。"
+
+        sessions: list[dict[str, Any]] = []
+        with open(index_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sessions.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        if not sessions:
+            return "暂无 Kimi 历史会话记录。"
+
+        # Keep latest session per workDir
+        latest_by_dir: dict[str, dict[str, Any]] = {}
+        for s in sessions:
+            wd = s.get("workDir", "未知")
+            sid = s.get("sessionId", "未知")
+            if wd not in latest_by_dir or sid > latest_by_dir[wd].get("sessionId", ""):
+                latest_by_dir[wd] = s
+
+        lines = ["📋 Kimi 历史会话列表：", ""]
+        for i, (wd, s) in enumerate(sorted(latest_by_dir.items()), 1):
+            sid = s.get("sessionId", "未知")
+            display_wd = wd.replace(str(Path.home()), "~")
+            lines.append(f"{i}. {display_wd}")
+            lines.append(f"   ID: `{sid}`")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    async def _summarize_and_send(
+        self,
+        websocket: WebSocketServerProtocol,
+        session_id: str,
+        kimi_session: KimiSession,
+    ) -> None:
+        """Trigger session summary and send result back."""
+        if not kimi_session.kimi_session_id:
+            await self._send(
+                websocket, session_id, "idle",
+                "⚠️ 当前没有绑定的 Kimi 会话，无法总结。"
+            )
+            return
+
+        await self._send(websocket, session_id, "thinking", "正在总结会话进度...")
+        try:
+            summary = await kimi_session.summarize()
+            await self._send(
+                websocket, session_id, "idle",
+                f"📋 会话进度总结：\n\n{summary}"
+            )
+        except Exception as exc:
+            logger.exception("Summarize failed")
+            await self._send(
+                websocket, session_id, "idle", f"总结失败: {exc}"
+            )
+
     async def _process_message(
         self, websocket: WebSocketServerProtocol, msg: UpstreamMessage
     ) -> None:
@@ -184,26 +265,46 @@ class KimiCodeBridgeServer:
         if msg.action not in ("user_input", "inject"):
             return
 
-        # Send thinking status
+        # Get or create kimi session
+        try:
+            kimi_session = await self._get_session(session_id)
+        except Exception as exc:
+            logger.exception("[%s] Failed to get/create session", session_id)
+            await self._send(websocket, session_id, "idle", f"会话初始化失败: {exc}")
+            return
+
+        # Apply control parameters from payload
+        if msg.payload.work_dir:
+            kimi_session.set_work_dir(Path(msg.payload.work_dir))
+        if msg.payload.kimi_session_id:
+            kimi_session.set_kimi_session_id(msg.payload.kimi_session_id)
+
+        # Handle control commands (inject action)
+        if msg.action == "inject":
+            if text == "__LIST_SESSIONS__":
+                reply = self._list_kimi_sessions()
+                await self._send(websocket, session_id, "idle", reply)
+                return
+            elif text == "__USE_SESSION__":
+                await self._summarize_and_send(websocket, session_id, kimi_session)
+                return
+            elif text == "__CD__":
+                await self._send(
+                    websocket, session_id, "idle",
+                    f"✅ 工作目录已切换至: `{kimi_session.work_dir}`"
+                )
+                return
+
+        # Normal message flow
         await self._send(websocket, session_id, "thinking", "正在分析问题...")
 
         try:
-            kimi_session = await self._get_session(session_id)
-
-            # Send executing status
             await self._send(websocket, session_id, "executing", "正在调用 Kimi Code...")
-
-            # Call kimi CLI
             reply = await kimi_session.ask(text)
-
-            # Send final reply
             await self._send(websocket, session_id, "idle", reply)
-
         except Exception as exc:
             logger.exception("[%s] Processing error", session_id)
-            await self._send(
-                websocket, session_id, "idle", f"处理出错: {exc}"
-            )
+            await self._send(websocket, session_id, "idle", f"处理出错: {exc}")
 
     async def _send(
         self,

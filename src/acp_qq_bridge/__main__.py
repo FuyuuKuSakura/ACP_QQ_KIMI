@@ -15,7 +15,6 @@ import nonebot
 from nonebot import get_driver
 
 from acp_qq_bridge.adapters.agent_ws import AgentWebSocketAdapter
-from acp_qq_bridge.adapters.qq_bot import init_qq_bot
 from acp_qq_bridge.config import BridgeConfig, load_config
 from acp_qq_bridge.core.runtime import SessionManager
 from acp_qq_bridge.core.security import SecurityEngine
@@ -97,6 +96,10 @@ def main() -> None:
     nonebot.init()
     driver = get_driver()
 
+    # Register OneBot V11 adapter explicitly
+    from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
+    driver.register_adapter(OneBotV11Adapter)
+
     @driver.on_startup
     async def _on_startup() -> None:
         """Establish agent connection and start background tasks."""
@@ -134,6 +137,9 @@ def main() -> None:
         logger.info("Bridge shutdown complete")
 
     # 5. Initialise QQ bot matchers and downstream handler
+    # Import after nonebot.init() to avoid "NoneBot has not been initialized" error
+    from acp_qq_bridge.adapters.qq_bot import init_qq_bot
+
     init_qq_bot(
         config=cfg,
         session_manager=session_manager,

@@ -33,6 +33,13 @@ acp-qq-bridge = "acp_qq_bridge.__main__:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/acp_qq_bridge"]
 
+[tool.nonebot]
+adapters = [
+    { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" }
+]
+plugins = []
+plugin_dirs = []
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

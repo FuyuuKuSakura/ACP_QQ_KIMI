@@ -358,22 +358,24 @@ class SecurityEngine:
 
     # -- Public API ----------------------------------------------------------
 
-    def validate_command(self, text: str) -> SecurityResult:
+    def validate_command(self, text: str, strict: bool = True) -> SecurityResult:
         """Validate a plain-text command string.
 
         Performs, in order:
-        1. Sensitive-word filtering
-        2. Whitelist check (main command only)
+        1. Sensitive-word filtering (always)
+        2. Whitelist check (main command only, only when *strict* is ``True``)
 
         All validation attempts are recorded in the audit log.
 
         Args:
             text: Raw command text to validate.
+            strict: When ``False``, skip the whitelist check so that regular
+                chat messages are not rejected.
 
         Returns:
             :class:`SecurityResult` indicating pass / fail status.
         """
-        # 1. Sensitive words
+        # 1. Sensitive words (always checked)
         has_sensitive, hits = self._filter.check(text)
         if has_sensitive:
             return SecurityResult(
@@ -382,8 +384,8 @@ class SecurityEngine:
                 details={"hits": hits, "stage": "sensitive_word_filter"},
             )
 
-        # 2. Whitelist
-        if not self._whitelist.check(text):
+        # 2. Whitelist (only for command-like messages)
+        if strict and not self._whitelist.check(text):
             return SecurityResult(
                 passed=False,
                 reason="Command not in whitelist",

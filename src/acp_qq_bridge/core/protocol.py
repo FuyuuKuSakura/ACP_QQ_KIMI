@@ -73,6 +73,8 @@ class UpstreamPayload(BaseModel):
 
     text: str
     raw_signal: str | None = None
+    work_dir: str | None = None
+    kimi_session_id: str | None = None
 
 
 class DownstreamMessage(ACPMessage):
