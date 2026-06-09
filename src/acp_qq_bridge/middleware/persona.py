@@ -37,6 +37,11 @@ class PersonaTemplate:
         tone_keywords: List of tone / catch-phrase keywords that may be
             randomly injected into the text.
         emoji_set: Pool of emoji / emoticons to randomly insert.
+        system_prompt: System prompt injected into every LLM call to
+            make the model truly speak in character.
+        corpus_file: Path to a text file containing few-shot dialogue
+            examples (Q/A pairs) for the model to learn the style.
+        sticker_mapping: Maps mood keys to sticker image file paths.
     """
 
     id: str
@@ -45,6 +50,9 @@ class PersonaTemplate:
     suffix: str = ""
     tone_keywords: list[str] = field(default_factory=list)
     emoji_set: list[str] = field(default_factory=list)
+    system_prompt: str = ""
+    corpus_file: str | None = None
+    sticker_mapping: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +121,9 @@ def _load_yaml_personas(directory: str | Path) -> dict[str, PersonaTemplate]:
                     suffix=data.get("suffix", ""),
                     tone_keywords=data.get("tone_keywords", []),
                     emoji_set=data.get("emoji_set", []),
+                    system_prompt=data.get("system_prompt", ""),
+                    corpus_file=data.get("corpus_file"),
+                    sticker_mapping=data.get("sticker_mapping", {}),
                 )
         except Exception:
             logger.exception("Failed to load persona YAML: %s", file)
@@ -161,6 +172,82 @@ class PersonaSkill:
         self._personas = personas if personas is not None else _build_in_personas()
         self._default = default
         self._active = default
+
+    def get_persona(self, persona_id: str | None = None) -> PersonaTemplate | None:
+        """Return the template for *persona_id* or the active one."""
+        pid = persona_id or self._active
+        return self._personas.get(pid)
+
+    def build_system_prompt(self, persona_id: str | None = None) -> str:
+        """Build the full system prompt including few-shot corpus.
+
+        This prompt is meant to be injected at the beginning of every
+        LLM call so the model actually replies in character.
+        """
+        persona = self.get_persona(persona_id)
+        if persona is None:
+            return ""
+
+        parts: list[str] = []
+        if persona.system_prompt:
+            parts.append(f"[System]\n{persona.system_prompt.strip()}")
+
+        # Load and inject few-shot corpus
+        few_shot = self._load_corpus(persona.corpus_file)
+        if few_shot:
+            parts.append("[Examples]")
+            parts.extend(few_shot)
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _load_corpus(corpus_file: str | None) -> list[str]:
+        """Load few-shot Q/A pairs from a corpus file.
+
+        Expected format (plain text):
+            Q: 用户说的话
+            A: 角色的回复
+            Q: ...
+            A: ...
+        """
+        if not corpus_file:
+            return []
+        path = Path(corpus_file)
+        if not path.exists():
+            # Try relative to personas dir
+            path = Path("personas") / corpus_file
+        if not path.exists():
+            return []
+
+        examples: list[str] = []
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                content = fh.read()
+        except Exception:
+            logger.exception("Failed to read corpus: %s", path)
+            return []
+
+        # Parse Q/A pairs
+        current_q: str | None = None
+        for line in content.strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("q:") or line.startswith("用户:"):
+                current_q = line[2:].strip()
+            elif line.lower().startswith("a:") or line.startswith("角色:"):
+                if current_q is not None:
+                    reply = line[2:].strip()
+                    examples.append(f"用户: {current_q}")
+                    examples.append(f"角色: {reply}")
+                    current_q = None
+
+        # Limit to last N pairs to avoid context overflow
+        max_pairs = 10
+        if len(examples) > max_pairs * 2:
+            examples = examples[-max_pairs * 2:]
+
+        return examples
 
     # ------------------------------------------------------------------ #
     # Public API

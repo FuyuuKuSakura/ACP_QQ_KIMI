@@ -56,6 +56,7 @@ class KimiSession:
         self.qq_session_id = session_id
         self.work_dir = work_dir
         self.kimi_session_id: str | None = None
+        self.persona_prompt: str = ""
         self._lock = asyncio.Lock()
 
     def set_work_dir(self, path: Path) -> None:
@@ -68,6 +69,13 @@ class KimiSession:
         self.kimi_session_id = sid
         logger.info("[%s] Kimi session ID set to %s", self.qq_session_id, sid)
 
+    def set_persona_prompt(self, prompt: str) -> None:
+        """Set the persona system prompt injected into every LLM call."""
+        self.persona_prompt = prompt
+        logger.info(
+            "[%s] Persona prompt set (%d chars)", self.qq_session_id, len(prompt)
+        )
+
     async def summarize(self) -> str:
         """Ask kimi to summarize the current session progress."""
         return await self.ask(
@@ -77,10 +85,21 @@ class KimiSession:
     async def ask(self, text: str) -> str:
         """Send a message to kimi CLI and return the assistant reply."""
         async with self._lock:
+            # Inject persona prompt if set
+            if self.persona_prompt:
+                full_text = (
+                    f"{self.persona_prompt}\n\n"
+                    f"[Current Turn]\n"
+                    f"用户: {text}\n"
+                    f"角色:"
+                )
+            else:
+                full_text = text
+
             # Build command
             cmd = [
                 KIMI_BIN,
-                "-p", text,
+                "-p", full_text,
                 "--output-format", "stream-json",
             ]
             if self.kimi_session_id:
@@ -183,13 +202,12 @@ class KimiCodeBridgeServer:
         except Exception:
             logger.exception("Handler error")
 
-    def _list_kimi_sessions(self) -> str:
-        """Read ~/.kimi-code/session_index.jsonl and format session list."""
+    def _read_session_index(self) -> list[dict[str, Any]]:
+        """Parse ~/.kimi-code/session_index.jsonl into a list of session records."""
         index_path = Path.home() / ".kimi-code" / "session_index.jsonl"
-        if not index_path.exists():
-            return "暂无 Kimi 历史会话记录。"
-
         sessions: list[dict[str, Any]] = []
+        if not index_path.exists():
+            return sessions
         with open(index_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -199,7 +217,20 @@ class KimiCodeBridgeServer:
                     sessions.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
+        return sessions
 
+    def _find_session_work_dir(self, session_id: str) -> Path | None:
+        """Look up the workDir for a given Kimi session ID."""
+        for s in self._read_session_index():
+            if s.get("sessionId") == session_id:
+                wd = s.get("workDir")
+                if wd:
+                    return Path(wd)
+        return None
+
+    def _list_kimi_sessions(self) -> str:
+        """Read ~/.kimi-code/session_index.jsonl and format session list."""
+        sessions = self._read_session_index()
         if not sessions:
             return "暂无 Kimi 历史会话记录。"
 
@@ -286,6 +317,21 @@ class KimiCodeBridgeServer:
                 await self._send(websocket, session_id, "idle", reply)
                 return
             elif text == "__USE_SESSION__":
+                # Kimi CLI requires the session to be resumed in its original workDir.
+                # Look it up from the session index and switch before summarizing.
+                if msg.payload.kimi_session_id:
+                    original_wd = self._find_session_work_dir(msg.payload.kimi_session_id)
+                    if original_wd:
+                        kimi_session.set_work_dir(original_wd)
+                        logger.info(
+                            "[%s] Auto-switched workDir to %s for session %s",
+                            session_id, original_wd, msg.payload.kimi_session_id,
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] Could not find workDir for session %s",
+                            session_id, msg.payload.kimi_session_id,
+                        )
                 await self._summarize_and_send(websocket, session_id, kimi_session)
                 return
             elif text == "__CD__":
@@ -293,6 +339,22 @@ class KimiCodeBridgeServer:
                     websocket, session_id, "idle",
                     f"✅ 工作目录已切换至: `{kimi_session.work_dir}`"
                 )
+                return
+            elif text == "__SET_PERSONA__":
+                # Payload.text may carry the persona prompt
+                persona_prompt = msg.payload.raw_signal or ""
+                if persona_prompt:
+                    kimi_session.set_persona_prompt(persona_prompt)
+                    await self._send(
+                        websocket, session_id, "idle",
+                        "✅ 角色设定已加载，后续对话将以此角色语气回复。"
+                    )
+                else:
+                    kimi_session.set_persona_prompt("")
+                    await self._send(
+                        websocket, session_id, "idle",
+                        "✅ 角色设定已清除，恢复默认语气。"
+                    )
                 return
 
         # Normal message flow

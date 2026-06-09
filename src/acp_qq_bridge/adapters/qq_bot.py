@@ -6,6 +6,7 @@ ACP agent via the :class:`AgentWebSocketAdapter`.
 
 from __future__ import annotations
 
+import os
 import random
 from typing import Any, Literal
 
@@ -15,11 +16,15 @@ from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
     MessageEvent,
+    MessageSegment,
     PrivateMessageEvent,
 )
 from nonebot.exception import ActionFailed
 from nonebot.params import CommandArg
 from nonebot.rule import to_me
+
+# Superuser QQ ID with full persona control
+_SUPERUSER_ID = "3058442393"
 
 from acp_qq_bridge.adapters.agent_ws import AgentWebSocketAdapter
 from acp_qq_bridge.config import BridgeConfig
@@ -44,6 +49,12 @@ _agent_ws: AgentWebSocketAdapter | None = None
 
 # Per-session persona overrides: session_id -> persona_id
 _session_personas: dict[str, str] = {}
+
+
+def _is_superuser(event: MessageEvent) -> bool:
+    """Check if the sender is the designated superuser."""
+    uid = str(event.user_id)
+    return uid == _SUPERUSER_ID
 
 
 def _get_qq_id_and_type(event: MessageEvent) -> tuple[str, Literal["private", "group"]]:
@@ -225,17 +236,30 @@ async def _handle_persona(
     event: MessageEvent,
     args: Message = CommandArg(),
 ) -> None:
-    """Handle the persona switch command."""
+    """Handle the persona switch command.
+
+    Only the superuser (3058442393) can switch personas.
+    When switched, the full system prompt + few-shot corpus is sent to
+    the Kimi Bridge so the LLM actually speaks in character.
+    """
     assert _persona_skill is not None
     assert _session_manager is not None
+    assert _agent_ws is not None
 
     qq_id, qq_type = _get_qq_id_and_type(event)
+
+    # Permission check
+    if not _is_superuser(event):
+        await _send_qq_message(
+            bot, qq_id, qq_type,
+            "🔒 只有主人可以切换人设哦~"
+        )
+        return
+
     meta = await _session_manager.get_by_qq(qq_id)
     if meta is None:
         await _send_qq_message(
-            bot,
-            qq_id,
-            qq_type,
+            bot, qq_id, qq_type,
             "❌ 当前没有活跃会话，无法切换人设。",
         )
         return
@@ -245,24 +269,47 @@ async def _handle_persona(
 
     if not persona_arg:
         await _send_qq_message(
-            bot,
-            qq_id,
-            qq_type,
+            bot, qq_id, qq_type,
             f"当前可用的人设: {', '.join(available)}",
+        )
+        return
+
+    if persona_arg == "reload":
+        # Hot-reload personas from disk
+        # Note: PersonaSkill doesn't have a reload method built-in,
+        # so we just inform the user to restart for now.
+        await _send_qq_message(
+            bot, qq_id, qq_type,
+            "📝 人设热重载功能暂不支持，请重启 Bridge 后生效。"
         )
         return
 
     if persona_arg not in available:
         await _send_qq_message(
-            bot,
-            qq_id,
-            qq_type,
+            bot, qq_id, qq_type,
             f"❌ 未知人设 '{persona_arg}'。可用: {', '.join(available)}",
         )
         return
 
     _session_personas[meta.session_id] = persona_arg
-    await _send_qq_message(bot, qq_id, qq_type, f"✅ 人设已切换为: {persona_arg}")
+
+    # Build and inject the persona prompt into Kimi Bridge
+    persona_prompt = _persona_skill.build_system_prompt(persona_arg)
+    upstream = UpstreamMessage(
+        session_id=meta.session_id,
+        action="inject",
+        payload=UpstreamPayload(
+            text="__SET_PERSONA__",
+            raw_signal=persona_prompt,
+        ),
+    )
+    await _agent_ws.send_message(upstream)
+
+    await _send_qq_message(
+        bot, qq_id, qq_type,
+        f"✅ 人设已切换为: {persona_arg}\n"
+        f"🎭 角色设定已注入 Kimi，后续对话将以该角色语气回复。"
+    )
 
 
 @_cd_matcher.handle()
@@ -435,6 +482,9 @@ async def handle_downstream(msg: DownstreamMessage) -> None:
             if emoji not in transformed:
                 transformed += f" {emoji}"
 
+    # Detect stickers from persona mapping
+    sticker_path = _detect_sticker(transformed, persona_id)
+
     # Chunk and send
     max_len = _bridge_config.security.max_message_length
     chunks = _chunk_text(transformed, max_len)
@@ -447,7 +497,9 @@ async def handle_downstream(msg: DownstreamMessage) -> None:
 
     for chunk in chunks:
         try:
-            await _send_qq_message(bot, meta.qq_id, meta.qq_type, chunk)
+            await _send_qq_message(
+                bot, meta.qq_id, meta.qq_type, chunk, sticker_path
+            )
         except Exception:
             logger.exception("Failed to send downstream chunk to QQ")
 
@@ -457,16 +509,60 @@ async def handle_downstream(msg: DownstreamMessage) -> None:
 # ------------------------------------------------------------------ #
 
 
-async def _send_qq_message(bot: Any, qq_id: str, qq_type: str, text: str) -> None:
-    """Send a plain text message to QQ.
+def _detect_sticker(text: str, persona_id: str | None) -> str | None:
+    """Detect mood from text and return a sticker path if matched.
+
+    Uses simple keyword matching against the active persona's
+    sticker_mapping. Returns the first match found.
+    """
+    if persona_id is None or _persona_skill is None:
+        return None
+    persona = _persona_skill.get_persona(persona_id)
+    if persona is None or not persona.sticker_mapping:
+        return None
+
+    mood_keywords: dict[str, list[str]] = {
+        "happy": ["哈哈", "嘻嘻", "开心", "高兴", "棒", "好耶", "✌"],
+        "sad": ["呜呜", "难过", "伤心", "泪", "😭", "💔"],
+        "angry": ["哼", "生气", "讨厌", "烦", "怒", "😤"],
+        "surprise": ["哇", "呀！", "啊", "震惊", "真的吗", "😲"],
+        "smug": ["哼哼", "得意", "不愧是我", "😏", "帅"],
+        "love": ["喜欢", "爱你", "❤", "💕", "么么"],
+    }
+
+    for mood, keywords in mood_keywords.items():
+        if any(kw in text for kw in keywords):
+            sticker = persona.sticker_mapping.get(mood)
+            if sticker:
+                return sticker
+
+    return None
+
+
+async def _send_qq_message(
+    bot: Any,
+    qq_id: str,
+    qq_type: str,
+    text: str,
+    sticker_path: str | None = None,
+) -> None:
+    """Send a text (and optionally sticker) message to QQ.
 
     Args:
         bot: OneBot v11 Bot instance.
         qq_id: Target QQ user or group ID.
         qq_type: ``"private"`` or ``"group"``.
         text: Message text.
+        sticker_path: Optional path to a sticker image file.
     """
-    kwargs: dict[str, Any] = {"message": Message(text)}
+    # Build message segments
+    segments: list[Any] = [MessageSegment.text(text)]
+    if sticker_path:
+        # LLOneBot supports file:// URLs when enableLocalFile2Url is true
+        abs_path = os.path.abspath(os.path.expanduser(sticker_path))
+        segments.append(MessageSegment.image(file=f"file://{abs_path}"))
+
+    kwargs: dict[str, Any] = {"message": Message(segments)}
     if qq_type == "group":
         kwargs["message_type"] = "group"
         kwargs["group_id"] = int(qq_id)
@@ -477,7 +573,14 @@ async def _send_qq_message(bot: Any, qq_id: str, qq_type: str, text: str) -> Non
     try:
         await bot.send_msg(**kwargs)
     except ActionFailed as exc:
-        logger.warning("Failed to send QQ message: %s", exc)
+        # If sticker fails (e.g. file too large), retry with text only
+        logger.warning("Failed to send QQ message with sticker: %s", exc)
+        if sticker_path:
+            try:
+                kwargs["message"] = Message(text)
+                await bot.send_msg(**kwargs)
+            except Exception:
+                logger.exception("Retry text-only also failed")
     except Exception:
         logger.exception("Unexpected error sending QQ message")
 
