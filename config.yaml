@@ -1,20 +1,49 @@
-# ACP-QQ Bridge 运行时配置模板
+# ACP-QQ Bridge 运行时配置
+# 根据你的 Agent 端和 QQ 端环境修改此文件
 
+# =============================================================================
 # Agent WebSocket 连接配置
+# =============================================================================
+# 根据你启动的 Agent 端选择对应的地址：
+#
+# 方案 1: Kimi Code CLI Bridge (本地 CLI 桥接)
+#   启动: python scripts/kimi_cli_bridge.py
+#   地址: ws://127.0.0.1:8765
+#
+# 方案 2: VSCode Bridge (VSCode 扩展桥接)
+#   启动: python scripts/kimi_vscode_bridge.py
+#   地址: ws://127.0.0.1:8766
+#
+# 方案 3: OpenAI API Agent (直接调用 Moonshot API)
+#   启动: python scripts/openai_agent_server.py
+#   地址: ws://127.0.0.1:8765
+#
+# 方案 4: Mock Agent (测试用)
+#   启动: python scripts/mock_agent_server.py
+#   地址: ws://127.0.0.1:18765
+# =============================================================================
 agent:
-  ws_url: "ws://localhost:8765"
-  token: "your-secure-token-here"
+  ws_url: "ws://127.0.0.1:8765"
+  token: ""
   heartbeat_interval: 30
   reconnect_max_interval: 30
   response_timeout: 60
 
+# =============================================================================
 # QQ 机器人配置
+# =============================================================================
+# LLOneBot / NapCat 通过反向 WebSocket 连接到 NoneBot2
+# NoneBot2 默认监听 127.0.0.1:8080
+# 在 LLOneBot 设置中填写: ws://127.0.0.1:8080/onebot/v11/ws
+# =============================================================================
 qq:
   command_prefixes: ["/", "!"]
   superusers: []
   session_ttl: 3600
 
+# =============================================================================
 # 安全配置
+# =============================================================================
 security:
   enable_ast_audit: true
   enable_sensitive_filter: true
@@ -22,7 +51,9 @@ security:
   sensitive_patterns: ["rm -rf", "mkfs", "dd if=/dev/zero", ">/dev/sda", "format", "del /f /s /q"]
   max_message_length: 4096
 
+# =============================================================================
 # 人设配置
+# =============================================================================
 persona:
   default_persona: "assistant"
   personas_dir: "./personas"

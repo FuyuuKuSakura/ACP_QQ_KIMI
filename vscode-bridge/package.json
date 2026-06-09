@@ -1,0 +1,41 @@
+{
+  "name": "kimi-bridge",
+  "displayName": "Kimi Bridge for ACP-QQ",
+  "description": "Bridge Kimi Code VSCode extension to ACP-QQ Bridge via filesystem IPC",
+  "version": "0.1.0",
+  "publisher": "your-name",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:kimiBridge.enable"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "kimiBridge.enable",
+        "title": "Kimi Bridge: Enable",
+        "category": "Kimi Bridge"
+      },
+      {
+        "command": "kimiBridge.disable",
+        "title": "Kimi Bridge: Disable",
+        "category": "Kimi Bridge"
+      },
+      {
+        "command": "kimiBridge.status",
+        "title": "Kimi Bridge: Show Status",
+        "category": "Kimi Bridge"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.74.0",
+    "typescript": "^5.0.0"
+  }
+}
