@@ -22,6 +22,8 @@ class AgentConfig:
     heartbeat_interval: int
     reconnect_max_interval: int
     response_timeout: int
+    # kimi CLI 模型别名（如 "moonshot-cn/kimi-k2.6"）；留空 = 用 CLI 默认模型
+    model: str = ""
 
 
 @dataclass
@@ -53,6 +55,21 @@ class PersonaConfig:
 
 
 @dataclass
+class LifeOSConfig:
+    """LifeOS 任务管理扩展设置（Obsidian vault + QQ 遥控）。"""
+
+    enabled: bool
+    vault_path: str
+    target_qq: str
+    plain_message_mode: str
+    daily_brief_time: str
+    reminder_time: str
+    weekly_reminder: dict[str, Any]
+    persona: str
+    state_file: str
+
+
+@dataclass
 class BridgeConfig:
     """Top-level configuration object for ACP-QQ Bridge."""
 
@@ -60,6 +77,7 @@ class BridgeConfig:
     qq: QQConfig
     security: SecurityConfig
     persona: PersonaConfig
+    lifeos: LifeOSConfig
 
 
 _DEFAULT_CONFIG: dict[str, Any] = {
@@ -85,6 +103,17 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "persona": {
         "default_persona": "assistant",
         "personas_dir": "./personas",
+    },
+    "lifeos": {
+        "enabled": True,
+        "vault_path": "",
+        "target_qq": "3058442393",
+        "plain_message_mode": "agent",
+        "daily_brief_time": "04:00",
+        "reminder_time": "22:30",
+        "weekly_reminder": {"weekday": 6, "time": "10:00"},
+        "persona": "kaltsit",
+        "state_file": "logs/lifeos_state.json",
     },
 }
 
@@ -118,6 +147,7 @@ def load_config(path: str | Path | None = None) -> BridgeConfig:
         qq=QQConfig(**data["qq"]),
         security=SecurityConfig(**data["security"]),
         persona=PersonaConfig(**data["persona"]),
+        lifeos=LifeOSConfig(**data["lifeos"]),
     )
 
 

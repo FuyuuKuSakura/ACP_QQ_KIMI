@@ -114,9 +114,11 @@ def _load_yaml_personas(directory: str | Path) -> dict[str, PersonaTemplate]:
             with file.open("r", encoding="utf-8") as fh:
                 data = yaml.safe_load(fh)
             if isinstance(data, dict):
-                personas[file.stem] = PersonaTemplate(
-                    id=file.stem,
-                    name=data.get("name", file.stem),
+                # Prefer the semantic ``id`` from YAML, fall back to file stem.
+                persona_id = data.get("id") or file.stem
+                personas[persona_id] = PersonaTemplate(
+                    id=persona_id,
+                    name=data.get("name", persona_id),
                     prefix=data.get("prefix", ""),
                     suffix=data.get("suffix", ""),
                     tone_keywords=data.get("tone_keywords", []),
@@ -202,13 +204,22 @@ class PersonaSkill:
 
     @staticmethod
     def _load_corpus(corpus_file: str | None) -> list[str]:
-        """Load few-shot Q/A pairs from a corpus file.
+        """Load few-shot examples from a corpus file.
 
-        Expected format (plain text):
+        Supports three formats:
+
+        1. Full dialogue pairs (plain text):
             Q: 用户说的话
             A: 角色的回复
             Q: ...
             A: ...
+
+        2. Character-only lines (implicit user prompt):
+            C: 角色说的话
+            C: ...
+
+        3. Explicit character lines:
+            角色: 角色说的话
         """
         if not corpus_file:
             return []
@@ -227,7 +238,7 @@ class PersonaSkill:
             logger.exception("Failed to read corpus: %s", path)
             return []
 
-        # Parse Q/A pairs
+        # Parse Q/A pairs and standalone C:/角色: lines
         current_q: str | None = None
         for line in content.strip().splitlines():
             line = line.strip()
@@ -241,6 +252,15 @@ class PersonaSkill:
                     examples.append(f"用户: {current_q}")
                     examples.append(f"角色: {reply}")
                     current_q = None
+                else:
+                    # Standalone character line (no preceding Q:)
+                    reply = line[2:].strip()
+                    examples.append("用户: （和你聊天）")
+                    examples.append(f"角色: {reply}")
+            elif line.lower().startswith("c:"):
+                reply = line[2:].strip()
+                examples.append("用户: （和你聊天）")
+                examples.append(f"角色: {reply}")
 
         # Limit to last N pairs to avoid context overflow
         max_pairs = 10

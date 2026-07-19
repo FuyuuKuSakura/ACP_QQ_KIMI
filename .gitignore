@@ -62,3 +62,6 @@ htmlcov/
 # Runtime data
 *.pid
 *.pid.lock
+
+# Persona 表情包资源（体积大，本地保留）
+stickers/

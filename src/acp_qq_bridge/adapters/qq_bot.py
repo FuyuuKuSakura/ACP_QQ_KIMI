@@ -163,6 +163,14 @@ async def _handle_message(bot: Bot, event: MessageEvent) -> None:
     if not raw_text.strip():
         return
 
+    # LifeOS inbox 模式：主人私聊普通消息直进 Inbox，不发给 agent
+    from acp_qq_bridge.adapters import lifeos
+
+    if qq_type == "private" and _is_superuser(event) and lifeos.is_inbox_mode():
+        receipt = await lifeos.quick_capture(raw_text)
+        await _send_qq_message(bot, qq_id, qq_type, receipt)
+        return
+
     session_id = await _ensure_session(qq_id, qq_type)
 
     # Security check - only validate whitelist for command-like messages
@@ -198,7 +206,8 @@ async def _handle_stop(bot: Bot, event: MessageEvent) -> None:
     assert _agent_ws is not None
 
     qq_id, qq_type = _get_qq_id_and_type(event)
-    meta = await _session_manager.get_by_qq(qq_id)
+    session_id = await _ensure_session(qq_id, qq_type)
+    meta = await _session_manager.get_by_session(session_id)
     if meta is None:
         await _send_qq_message(bot, qq_id, qq_type, "❌ 当前没有活跃会话。")
         return
@@ -215,7 +224,8 @@ async def _handle_status(bot: Bot, event: MessageEvent) -> None:
     assert _session_manager is not None
 
     qq_id, qq_type = _get_qq_id_and_type(event)
-    meta = await _session_manager.get_by_qq(qq_id)
+    session_id = await _ensure_session(qq_id, qq_type)
+    meta = await _session_manager.get_by_session(session_id)
     if meta is None:
         await _send_qq_message(bot, qq_id, qq_type, "ℹ️ 当前没有活跃会话。")
         return
@@ -257,7 +267,8 @@ async def _handle_persona(
         )
         return
 
-    meta = await _session_manager.get_by_qq(qq_id)
+    session_id = await _ensure_session(qq_id, qq_type)
+    meta = await _session_manager.get_by_session(session_id)
     if meta is None:
         await _send_qq_message(
             bot, qq_id, qq_type,
@@ -324,7 +335,8 @@ async def _handle_cd(
     assert _agent_ws is not None
 
     qq_id, qq_type = _get_qq_id_and_type(event)
-    meta = await _session_manager.get_by_qq(qq_id)
+    session_id = await _ensure_session(qq_id, qq_type)
+    meta = await _session_manager.get_by_session(session_id)
     if meta is None:
         await _send_qq_message(bot, qq_id, qq_type, "❌ 当前没有活跃会话。")
         return
@@ -378,7 +390,7 @@ async def _handle_session(
     # Auto-create session if none exists — session management commands
     # should work even before the first regular chat.
     session_id = await _ensure_session(qq_id, qq_type)
-    meta = await _session_manager.get_by_qq(qq_id)
+    meta = await _session_manager.get_by_session(session_id)
     if meta is None:
         await _send_qq_message(bot, qq_id, qq_type, "❌ 当前没有活跃会话。")
         return
@@ -473,6 +485,13 @@ async def handle_downstream(msg: DownstreamMessage) -> None:
     assert _persona_skill is not None
     assert _bridge_config is not None
 
+    # LifeOS 专用会话：改路由到 target_qq 私聊，跳过 PersonaSkill.transform
+    from acp_qq_bridge.adapters import lifeos
+
+    if lifeos.is_lifeos_session(msg.session.session_id):
+        await _handle_lifeos_downstream(msg)
+        return
+
     meta = await _session_manager.get_by_session(msg.session.session_id)
     if meta is None or meta.qq_id is None or meta.qq_type is None:
         logger.warning(
@@ -495,7 +514,12 @@ async def handle_downstream(msg: DownstreamMessage) -> None:
     text = payload.content
 
     if payload.type == "status_update":
-        text = f"[状态] {msg.session.status}: {text}"
+        # Progress messages (thinking/executing/working) are shown directly
+        # so the user gets live feedback during long-running tasks.
+        if msg.session.status in ("thinking", "executing", "working"):
+            pass  # keep text as-is
+        else:
+            text = f"[状态] {msg.session.status}: {text}"
 
     # Persona transformation
     transformed = _persona_skill.transform(text, persona_id)
@@ -538,33 +562,91 @@ async def handle_downstream(msg: DownstreamMessage) -> None:
 # ------------------------------------------------------------------ #
 
 
+async def _handle_lifeos_downstream(msg: DownstreamMessage) -> None:
+    """LifeOS 专用会话的下行消息：私聊推送 target_qq，不做 persona transform。
+
+    中间状态（thinking/executing/working）不推送；/周结 完成后若存在
+    新鲜的 .qq.txt 精简版，优先推送它的内容。
+    """
+    assert _bridge_config is not None
+    from acp_qq_bridge.adapters import lifeos
+
+    target_qq = lifeos.get_target_qq()
+    if target_qq is None:
+        return
+
+    if msg.payload.type != "text":
+        logger.debug("LifeOS 中间状态不推送: %s", msg.session.status)
+        return
+
+    text = lifeos.consume_fresh_qq_txt() or msg.payload.content
+
+    try:
+        bot = get_bot()
+    except ValueError:
+        logger.error("No QQ bot instance available to send LifeOS downstream message")
+        lifeos.notify_lifeos_delivered(False)
+        return
+
+    ok = True
+    for chunk in _chunk_text(text, _bridge_config.security.max_message_length):
+        try:
+            await _send_qq_message(bot, target_qq, "private", chunk)
+        except Exception:
+            logger.exception("Failed to send LifeOS downstream chunk to QQ")
+            ok = False
+    lifeos.notify_lifeos_delivered(ok)
+
+
 def _detect_sticker(text: str, persona_id: str | None) -> str | None:
     """Detect mood from text and return a sticker path if matched.
 
     Uses simple keyword matching against the active persona's
-    sticker_mapping. Returns the first match found.
+    sticker_mapping. Supports both English mood keys and the exact
+    Chinese keys used in a persona's sticker_mapping.
     """
     if persona_id is None or _persona_skill is None:
+        logger.debug("Sticker skipped: no active persona")
         return None
     persona = _persona_skill.get_persona(persona_id)
     if persona is None or not persona.sticker_mapping:
+        logger.debug("Sticker skipped: persona %s has no sticker mapping", persona_id)
         return None
 
+    # Explicit sticker request: random sticker from the persona pool
+    explicit_request_keywords = ["表情包", "表情", "sticker", "贴图"]
+    if any(kw in text.lower() for kw in explicit_request_keywords):
+        sticker = random.choice(list(persona.sticker_mapping.values()))
+        logger.info("Explicit sticker request matched, returning: %s", sticker)
+        return sticker
+
     mood_keywords: dict[str, list[str]] = {
+        # English mood keys
         "happy": ["哈哈", "嘻嘻", "开心", "高兴", "棒", "好耶", "✌"],
         "sad": ["呜呜", "难过", "伤心", "泪", "😭", "💔"],
         "angry": ["哼", "生气", "讨厌", "烦", "怒", "😤"],
         "surprise": ["哇", "呀！", "啊", "震惊", "真的吗", "😲"],
         "smug": ["哼哼", "得意", "不愧是我", "😏", "帅"],
         "love": ["喜欢", "爱你", "❤", "💕", "么么"],
+        # Chinese keys used by Exusiai.yaml
+        "不爽": ["不爽", "讨厌", "烦死了", "气死了"],
+        "交给我吧": ["交给我", "我来", "看我的", "放心"],
+        "做点什么吗": ["做点什么", "无聊", "干什么呢", "玩"],
+        "冲": ["冲", "上", "出发", "碾过去"],
+        "放松": ["放松", "休息", "歇会", "轻松"],
+        "非常开心": ["非常开心", "超开心", "太棒了", "完美", "好耶", "开心"],
     }
 
+    # First check moods that the persona actually has stickers for
     for mood, keywords in mood_keywords.items():
+        if mood not in persona.sticker_mapping:
+            continue
         if any(kw in text for kw in keywords):
-            sticker = persona.sticker_mapping.get(mood)
-            if sticker:
-                return sticker
+            sticker = persona.sticker_mapping[mood]
+            logger.info("Sticker mood matched: %s -> %s", mood, sticker)
+            return sticker
 
+    logger.debug("No sticker mood matched for text: %s", text[:50])
     return None
 
 
@@ -589,7 +671,14 @@ async def _send_qq_message(
     if sticker_path:
         # LLOneBot supports file:// URLs when enableLocalFile2Url is true
         abs_path = os.path.abspath(os.path.expanduser(sticker_path))
-        segments.append(MessageSegment.image(file=f"file://{abs_path}"))
+        image_uri = f"file://{abs_path}"
+        segments.append(MessageSegment.image(file=image_uri))
+        logger.info(
+            "Sending QQ message with sticker to %s (%s): %s",
+            qq_id, qq_type, image_uri,
+        )
+    else:
+        logger.debug("Sending plain text QQ message to %s (%s)", qq_id, qq_type)
 
     kwargs: dict[str, Any] = {"message": Message(segments)}
     if qq_type == "group":
@@ -608,6 +697,7 @@ async def _send_qq_message(
             try:
                 kwargs["message"] = Message(text)
                 await bot.send_msg(**kwargs)
+                logger.info("Retried text-only message successfully")
             except Exception:
                 logger.exception("Retry text-only also failed")
     except Exception:

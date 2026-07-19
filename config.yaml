@@ -28,6 +28,7 @@ agent:
   heartbeat_interval: 30
   reconnect_max_interval: 30
   response_timeout: 60
+  model: "moonshot-cn/kimi-k2.6"   # 留空 "" = 用 kimi CLI 默认模型；可用别名见 kimi provider list
 
 # =============================================================================
 # QQ 机器人配置
@@ -57,3 +58,17 @@ security:
 persona:
   default_persona: "assistant"
   personas_dir: "./personas"
+
+# =============================================================================
+# LifeOS 任务管理扩展（Obsidian vault + QQ 遥控）
+# =============================================================================
+lifeos:
+  enabled: true
+  vault_path: "/Users/fuyuuku/Library/Mobile Documents/com~apple~CloudDocs/Notesss"
+  target_qq: "3058442393"          # 私聊推送目标
+  plain_message_mode: "agent"      # "agent"(默认，保持现状) | "inbox"(普通消息直进 Inbox)
+  daily_brief_time: "04:00"        # 每日日结+今日任务推送（agent 通道）
+  reminder_time: "22:30"           # 每日未记录提醒（直写判定）
+  weekly_reminder: { weekday: 6, time: "10:00" }  # 周日周结提醒
+  persona: "kaltsit"               # 凯尔希秘书人格（personas/kaltsit.yaml）
+  state_file: "logs/lifeos_state.json"  # last_fired 持久化（补发判定用）

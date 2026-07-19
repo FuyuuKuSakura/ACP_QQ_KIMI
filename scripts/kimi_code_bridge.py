@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Kimi Code CLI 0.6.0 ↔ ACP WebSocket Bridge (Production-Ready).
+"""Kimi Code CLI ↔ ACP WebSocket Bridge (Production-Ready).
+
+已验证 kimi CLI 版本: 0.27.0（升级前需回归验证 stream-json 输出格式）。
 
 专为 kimi-code CLI 设计，利用 --output-format stream-json 和 session 恢复机制：
 - 每个 QQ 会话绑定一个独立的 kimi session
 - 首次对话自动创建新 session
 - 后续对话通过 -S <session_id> 恢复上下文
 - 解析 stream-json 提取 assistant 回复
+- 模型可通过仓库根 config.yaml 的 agent.model 配置（-m，优先于 CLI 默认模型）
+- LifeOS 等无人值守会话（session_id 匹配或 cwd == lifeos.vault_path）标记 auto_approve；
+  注意 print 模式（-p）本身即非交互全自动，且与 -y/--auto 互斥，不可追加批准旗标
 
 Usage:
     python scripts/kimi_code_bridge.py
 
 Requirements:
-    kimi CLI 0.6.0+ 已安装且在 PATH 中
+    kimi CLI 0.27.0 已安装且在 PATH 中
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import websockets
+import yaml
 from websockets.server import WebSocketServerProtocol
 
 from acp_qq_bridge.core.protocol import (
@@ -48,6 +54,38 @@ WS_PORT = 8765
 
 KIMI_BIN = shutil.which("kimi") or shutil.which("kimi-code") or "kimi"
 
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+
+
+def _load_bridge_yaml() -> dict[str, Any]:
+    """读取仓库根 config.yaml（失败时返回空表，走 CLI 默认行为）。"""
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("读取 %s 失败，使用 CLI 默认配置", _CONFIG_PATH, exc_info=True)
+        return {}
+
+
+_BRIDGE_YAML = _load_bridge_yaml()
+
+# kimi 模型别名（config.yaml agent.model；环境变量 KIMI_MODEL 可覆盖；空 = CLI 默认）
+KIMI_MODEL: str = (
+    os.environ.get("KIMI_MODEL")
+    or str((_BRIDGE_YAML.get("agent") or {}).get("model") or "")
+)
+
+# LifeOS 等无人值守会话：spawn kimi 时追加 -y（全自动，作用域由 cwd 锁定兜底）
+# 判定方式：session_id 命中（环境变量 KIMI_AUTO_APPROVE_SESSIONS 可覆盖，
+# 默认 lifeos_main），或 payload.work_dir == config.yaml 的 lifeos.vault_path。
+KIMI_AUTO_APPROVE_SESSIONS: set[str] = {
+    s.strip()
+    for s in os.environ.get("KIMI_AUTO_APPROVE_SESSIONS", "lifeos_main").split(",")
+    if s.strip()
+}
+_LIFEOS_VAULT: str = str((_BRIDGE_YAML.get("lifeos") or {}).get("vault_path") or "")
+
 
 class KimiSession:
     """Manages a single kimi CLI session tied to a QQ session."""
@@ -57,7 +95,9 @@ class KimiSession:
         self.work_dir = work_dir
         self.kimi_session_id: str | None = None
         self.persona_prompt: str = ""
+        self.auto_approve: bool = False
         self._lock = asyncio.Lock()
+        self._current_proc: asyncio.subprocess.Process | None = None
 
     def set_work_dir(self, path: Path) -> None:
         """Switch the working directory for subsequent kimi CLI calls."""
@@ -102,13 +142,20 @@ class KimiSession:
                 "-p", full_text,
                 "--output-format", "stream-json",
             ]
+            # -m 优先于 kimi CLI 的 default_model
+            if KIMI_MODEL:
+                cmd += ["-m", KIMI_MODEL]
+            # LifeOS 等无人值守会话标记为 auto_approve（仅用于日志与语义标注；
+            # print 模式本身就是非交互全自动，-p 与 -y/--auto 互斥，不能追加任何批准旗标）
             if self.kimi_session_id:
                 cmd += ["-S", self.kimi_session_id]
 
             logger.info(
-                "[%s] Calling kimi (session=%s)",
+                "[%s] Calling kimi (session=%s, model=%s, yolo=%s)",
                 self.qq_session_id,
                 self.kimi_session_id or "new",
+                KIMI_MODEL or "cli-default",
+                self.auto_approve,
             )
 
             # Run kimi CLI
@@ -119,7 +166,11 @@ class KimiSession:
                 cwd=str(self.work_dir),
                 env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"},
             )
-            stdout, stderr = await proc.communicate()
+            self._current_proc = proc
+            try:
+                stdout, stderr = await proc.communicate()
+            finally:
+                self._current_proc = None
 
             if proc.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace").strip()
@@ -127,6 +178,16 @@ class KimiSession:
                 return f"Kimi CLI 执行出错 (code={proc.returncode}):\n{err}"[:2000]
 
             return self._parse_output(stdout.decode("utf-8", errors="replace"))
+
+    def interrupt(self) -> None:
+        """Kill the currently running kimi CLI subprocess, if any."""
+        proc = self._current_proc
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                logger.info("[%s] Interrupted running kimi subprocess", self.qq_session_id)
+            except ProcessLookupError:
+                pass
 
     def _parse_output(self, raw: str) -> str:
         """Parse stream-json output from kimi CLI."""
@@ -195,7 +256,9 @@ class KimiCodeBridgeServer:
                 if not isinstance(msg, UpstreamMessage):
                     continue
 
-                await self._process_message(websocket, msg)
+                # Process each message in its own task so that long-running
+                # kimi CLI calls do not block subsequent messages (e.g. interrupt).
+                asyncio.create_task(self._process_message(websocket, msg))
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("Bridge disconnected")
@@ -208,7 +271,7 @@ class KimiCodeBridgeServer:
         sessions: list[dict[str, Any]] = []
         if not index_path.exists():
             return sessions
-        with open(index_path, "r", encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -288,6 +351,12 @@ class KimiCodeBridgeServer:
         logger.info("[%s] action=%s text=%r", session_id, msg.action, text)
 
         if msg.action == "interrupt":
+            try:
+                kimi_session = self._sessions.get(session_id)
+                if kimi_session is not None:
+                    kimi_session.interrupt()
+            except Exception:
+                logger.exception("[%s] Failed to interrupt session", session_id)
             await self._send(
                 websocket, session_id, "interrupted", "任务已被用户打断。"
             )
@@ -309,6 +378,18 @@ class KimiCodeBridgeServer:
             kimi_session.set_work_dir(Path(msg.payload.work_dir))
         if msg.payload.kimi_session_id:
             kimi_session.set_kimi_session_id(msg.payload.kimi_session_id)
+
+        # LifeOS 无人值守会话：session_id 命中，或 cwd 锁定到 lifeos.vault_path
+        if session_id in KIMI_AUTO_APPROVE_SESSIONS or (
+            _LIFEOS_VAULT
+            and str(kimi_session.work_dir.resolve())
+            == str(Path(_LIFEOS_VAULT).expanduser().resolve())
+        ):
+            kimi_session.auto_approve = True
+            logger.info(
+                "[%s] Marked as unattended session (print mode is non-interactive by default)",
+                session_id,
+            )
 
         # Handle control commands (inject action)
         if msg.action == "inject":
@@ -360,13 +441,34 @@ class KimiCodeBridgeServer:
         # Normal message flow
         await self._send(websocket, session_id, "thinking", "正在分析问题...")
 
+        async def _heartbeat() -> None:
+            """Send periodic progress updates so the user knows we are alive."""
+            ticks = 0
+            while True:
+                await asyncio.sleep(15)
+                ticks += 1
+                await self._send(
+                    websocket, session_id, "working",
+                    f"⏳ 还在努力处理中，已经花了 {ticks * 15} 秒，请稍候..."
+                )
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
         try:
             await self._send(websocket, session_id, "executing", "正在调用 Kimi Code...")
+            logger.info("[%s] Asking kimi session...", session_id)
             reply = await kimi_session.ask(text)
+            logger.info("[%s] kimi reply length=%d", session_id, len(reply))
             await self._send(websocket, session_id, "idle", reply)
+            logger.info("[%s] Reply sent back to bridge", session_id)
         except Exception as exc:
             logger.exception("[%s] Processing error", session_id)
             await self._send(websocket, session_id, "idle", f"处理出错: {exc}")
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
     async def _send(
         self,
@@ -385,12 +487,15 @@ class KimiCodeBridgeServer:
         )
         try:
             await websocket.send(serialize_message(msg))
+            logger.info("[%s] downstream sent (status=%s, len=%d)", session_id, status, len(msg.payload.content))
         except Exception:
             logger.exception("Failed to send downstream")
 
     async def run(self, port: int) -> None:
         logger.info("Starting Kimi Code Bridge on ws://%s:%d", WS_HOST, port)
         logger.info("Kimi binary: %s", KIMI_BIN)
+        logger.info("Kimi model: %s", KIMI_MODEL or "(CLI 默认)")
+        logger.info("Auto-approve sessions: %s", sorted(KIMI_AUTO_APPROVE_SESSIONS))
         logger.info("Session workspace: %s", self._base_dir)
         async with websockets.serve(self._handle_client, WS_HOST, port):
             logger.info("Ready. Waiting for ACP-QQ-Bridge connection...")

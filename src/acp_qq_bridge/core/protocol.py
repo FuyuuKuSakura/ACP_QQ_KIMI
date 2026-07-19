@@ -43,7 +43,8 @@ class SessionState(BaseModel):
     """会话状态模型，用于下行消息中的 session 字段."""
 
     session_id: str
-    status: Literal["thinking", "executing", "idle", "interrupted"]
+    # "working" 由 kimi_code_bridge 的中间进度上报使用（qq_bot 已识别该状态）
+    status: Literal["thinking", "executing", "working", "idle", "interrupted"]
 
 
 class ArtifactChart(BaseModel):

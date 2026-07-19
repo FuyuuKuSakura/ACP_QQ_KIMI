@@ -105,6 +105,8 @@ def main() -> None:
         """Establish agent connection and start background tasks."""
         await agent_ws.connect()
         session_manager.start_cleanup_task(interval=60)
+        if lifeos_manager is not None:
+            lifeos_manager.start()
         logger.info("Bridge startup complete")
 
     @driver.on_shutdown
@@ -121,6 +123,12 @@ def main() -> None:
             session_manager.stop_cleanup_task()
         except Exception:
             logger.exception("Error stopping cleanup task")
+
+        if lifeos_manager is not None:
+            try:
+                lifeos_manager.stop()
+            except Exception:
+                logger.exception("Error stopping LifeOS scheduler")
 
         try:
             for meta in await session_manager.list_sessions():
@@ -146,6 +154,16 @@ def main() -> None:
         security=security,
         persona=persona,
         agent_ws=agent_ws,
+    )
+
+    # 5.5 Initialise LifeOS extension (commands + scheduler), after init_qq_bot
+    from acp_qq_bridge.adapters.lifeos import init_lifeos
+
+    lifeos_manager = init_lifeos(
+        config=cfg,
+        agent_ws=agent_ws,
+        security=security,
+        persona=persona,
     )
 
     # 6. Register OS signal handlers for graceful shutdown
